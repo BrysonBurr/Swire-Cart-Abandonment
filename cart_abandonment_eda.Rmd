@@ -1,0 +1,172 @@
+---
+title: "Cart Abandonment EDA"
+author: "Bryson Burr"
+date: "September 29, 2025"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r package loading, message=FALSE}
+library(tidyverse)
+library(janitor)
+```
+
+```{r load data, message=FALSE}
+customer <- read_csv("customer.csv")
+cutoff_times <- read_csv("cutoff_times.csv")
+google_analytics <- read_csv("google_analytics.csv")
+material <- read_csv("material.csv")
+operating_hours <- read_csv("operating_hours.csv")
+orders <- read_csv("orders.csv")
+sales <- read_csv("sales.csv")
+visit_plan <- read_csv("visit_plan.csv")
+```
+
+# Questions
+
+1. How many different event names are there in Google Analytics?
+2. Which event names are most common?
+3. How many items are usually in each cart?
+4. How many events does a customer usually have per transaction?
+5. What device is most common?
+6. What is the average time between events?
+7. What is the normal sequence from start to finish?
+
+```{r analyze}
+ga_copy <- google_analytics
+visit_copy <- visit_plan
+operating_copy <- operating_hours
+orders_copy <-  orders
+
+# make everything lowercase, get rid of any spaces
+ga_copy <- ga_copy |>
+  clean_names()
+
+visit_copy <- visit_copy |>
+  clean_names()
+
+operating_copy <- operating_copy |>
+  clean_names()
+
+orders_copy <- orders_copy |>
+  clean_names()
+```
+
+# EDA
+
+```{r google analytics eda}
+# checking structure of data first
+str(ga_copy)
+
+# how many different events can be measured?
+n_distinct(ga_copy$event_name)
+
+# what are the different event page names?
+unique(ga_copy$event_page_name)
+
+# Which events are most common? 
+# keep top 10 for readability
+ga_copy |>
+  count(event_name, sort = TRUE) |>
+  slice_max(n, n = 10)
+
+# number of distinct items in each cart?
+ga_copy <- ga_copy %>%
+  mutate(
+    num_items = ifelse(is.na(items) | items == "items", 0,
+                       str_count(items, fixed("{")))
+  )
+
+# how many events does a customer usually have before purchasing?
+events_before_purchase <- ga_copy %>%
+  arrange(customer_id, event_timestamp) %>%
+  group_by(customer_id) %>%
+  mutate(
+    # running counter of events
+    event_number = row_number(),
+    # identify purchases
+    purchase_flag = event_name == "purchase",
+    # "purchase cycle" increases each time a purchase happens
+    purchase_cycle = cumsum(lag(purchase_flag, default = FALSE))
+  ) %>%
+  group_by(customer_id, purchase_cycle) %>%
+  mutate(events_in_cycle = row_number()) %>%
+  ungroup() %>%
+  # keep only the purchase rows
+  filter(purchase_flag) %>%
+  select(customer_id, event_timestamp, events_in_cycle)
+
+events_before_purchase |>
+  summarise(
+    avg_events = mean(events_in_cycle),
+    median_events = median(events_in_cycle),
+    max_events = max(events_in_cycle)
+  )
+
+# is mobile or desktop used more?
+ga_copy |>
+  count(device_category) |>
+  ggplot(aes(x = reorder(device_category, n), y = n, fill = device_category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Device Categories Used",
+    x = "Device Category",
+    y = "Number of Events"
+  )
+
+# seeing what mobile devices are used most
+ga_copy |>
+  filter(device_category == "mobile") |>
+  count(device_mobile_brand_name) |>
+  ggplot(aes(x = reorder(device_mobile_brand_name, n), y = n, fill = device_mobile_brand_name)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Device mobile brand name Used",
+    x = "Device brand",
+    y = "Number of Events"
+  )
+
+# average time between events?
+
+# this code is taking too long to run
+event_gaps <- ga_copy |>
+  arrange(customer_id, event_timestamp) %>%
+  group_by(customer_id, event_date) %>%               # group within each day
+  mutate(
+    time_since_last = difftime(event_timestamp, lag(event_timestamp), units = "mins")
+  ) %>%
+  ungroup()
+
+# average time from start to purchase?
+time_to_purchase <- ga_copy %>%
+  arrange(customer_id, event_timestamp) %>%
+  group_by(customer_id) %>%
+  mutate(purchase_flag = event_name == "purchase")
+```
+
+```{r data cleaning}
+# changing frequency in visit table to days rather than codes
+visit_copy <- visit_copy |>
+  mutate(
+  frequency = case_when(
+    frequency == "01" ~ 7,
+    frequency == "02" ~ 14,
+    frequency == "04" ~ 28,
+    TRUE ~ NA))
+
+min(ga_copy$event_date)
+
+# don't need any information before first date on ga_copy
+visit_copy <- visit_copy |>
+  filter(elt_ts >= "2024-05-31")
+```

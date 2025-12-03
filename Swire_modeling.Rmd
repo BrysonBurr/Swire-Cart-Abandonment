@@ -1,0 +1,320 @@
+---
+title: "Swire Modeling"
+author: "Bryson Burr"
+date: "October 14, 2025"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+
+# Setup 
+
+## Package Loading
+
+# Setup 
+
+## Package Loading
+
+```{r package loading, message = FALSE}
+# load packages
+library(tidyverse)
+library(dplyr)
+library(skimr)
+library(ggplot2)
+library(janitor)
+library(lubridate)
+library(scales)
+library(pROC)
+library(caret)
+library(C50)
+library(xgboost)
+library(glmnet)
+library(ranger)
+library(broom)
+```
+
+## File Loading
+
+```{r file loading, message=FALSE}
+# load all files
+# clean csv's were saved from EDA notebook
+customer <- read_csv("customer.csv")
+cutoff_times <- read_csv("cutoff_times.csv")
+ga_clean <- read_csv("ga_clean.csv")
+material <- read_csv("material.csv")
+operating_hours <- read_csv("operating_hours.csv")
+orders_clean <- read_csv("orders_clean.csv")
+sales_clean <- read_csv("sales.csv")
+visits_clean <- read_csv("visits_clean.csv")
+```
+
+# Data Cleaning
+
+## Combining orders and google analytics
+
+```{r combining datasets, eval=FALSE}
+# some orders don't exist in the ga dataset get all the orders from the order dataset and add them to the ga dataset to ensure order windows can be calculated correctly
+# eval = FALSE in order to speed up document knitting
+
+# make event timestamp utc
+ga_clean$event_timestamp <- ymd_hms(ga_clean$event_timestamp, tz = "UTC")
+# ga clean is old source, want to keep these for any duplicates
+ga_clean <- ga_clean |>
+  mutate(source = "old")
+
+# calculate order quantity to help match
+ga_clean$total_quantity <- str_extract_all(ga_clean$items, '(?<="quantity":")\\d+(?:\\.\\d+)?') |>
+  lapply(as.numeric) |>
+  sapply(sum, na.rm = TRUE)
+
+# collapse all orders into one line with quantity
+collapsed_orders <- orders_clean |>
+  group_by(customer_id, created_date_utc) |>
+  reframe(total_quantity = sum(order_quantity)) |>
+  ungroup()
+
+# create dataset that can match ga_clean
+orders_as_events <- collapsed_orders |>
+  transmute(
+    customer_id,
+    event_name = "purchase",
+    event_grouped = "Purchase",
+    event_timestamp = ymd_hms(created_date_utc, tz = "UTC"),
+    total_quantity,
+    source = "new" # new source, if there are overlaps between this and ga clean, ga clean stays
+  )
+
+# get all purchases from ga clean and order dataset
+ga_purchases <- ga_clean |>
+  bind_rows(orders_as_events) |>
+  # only want purchases
+  filter(event_name == "purchase") |>
+  # make event date a date
+  mutate(event_date = as.Date(event_timestamp)) |>
+  # keep arrange to get rid of any duplicates
+  arrange(customer_id, event_date, total_quantity, desc(source)) |>
+  distinct(customer_id, event_date, total_quantity, .keep_all = TRUE) |>
+  # the following code is to deal with any orders that happen within a few hours of each other but are placed late enough that it processes on different days
+  arrange(customer_id, event_timestamp, total_quantity, desc(source)) |>
+  group_by(customer_id, total_quantity) |>
+  # create event group
+  # any event over 30 hours is in new group
+  mutate(
+    event_group = cumsum(
+      difftime(event_timestamp, lag(event_timestamp, default = first(event_timestamp)), units = "hours") > 30
+    )
+  ) |>
+  ungroup() |>
+  # get rid of any duplicate orders from same event group and quantity
+  distinct(customer_id, event_group, total_quantity, .keep_all = TRUE)
+
+# add the purchases back into ga clean
+ga_clean <- ga_clean |>
+  # keep only non purchase events
+  filter(event_name != "purchase") |>
+  # adding purchases back
+  bind_rows(ga_purchases) |>
+  select(-c("source", "total_quantity", "event_group"))
+```
+
+## Other cleaning
+
+```{r other cleaning}
+# changing variables to correct types
+customer_clean <- customer |>
+  mutate(CUSTOMER_NUMBER = as.character(CUSTOMER_NUMBER))
+
+material_clean <- material |>
+  mutate(MATERIAL_ID = as.character(MATERIAL_ID))
+
+hours_clean <- operating_hours |>
+  mutate(CALLING_ANCHOR_DATE = mdy(CALLING_ANCHOR_DATE),
+         CUSTOMER_NUMBER = as.character(CUSTOMER_NUMBER))
+```
+
+```{r load master model, message=FALSE}
+# load master model data that contains the created order windows
+master_model_data <- read_csv("master_model_data.csv")
+```
+
+## Remove NA's
+
+```{r remove na}
+# look at NA's
+colSums(is.na(master_model_data))
+
+#  get rid of any rows that don't have an order window
+master_model_data_clean <- master_model_data |>
+  filter(!is.na(TARGET_ABANDONED))
+```
+
+# Modeling setup
+
+## Sample Data
+
+```{r sample data}
+#sample data for quicker run times
+set.seed(123)
+
+#going to sample 50% of unique customers
+sample_ids <- master_model_data_clean |>
+  distinct(CUSTOMER_ID)  |>
+  slice_sample(prop = 0.5)  |>
+  pull(CUSTOMER_ID)
+
+# keep only those randomly sampled customers
+master_model_data_clean_sample <- master_model_data_clean  |>
+  filter(CUSTOMER_ID %in% sample_ids)
+
+#adding in a purchase indicating variable
+master_model_data_clean_sample <- master_model_data_clean_sample |>
+  mutate(is_purchase_event = ifelse(event_grouped == "Purchase", 1, 0))
+
+# turn any na's in device category to null
+master_model_data_clean_sample <- master_model_data_clean_sample |>
+  mutate(device_category = ifelse(is.na(device_category), "null", device_category))
+```
+
+## Classifier split
+
+```{r classifier split}
+# see sample classifier split
+mean(master_model_data_clean_sample$TARGET_ABANDONED)
+
+table(master_model_data_clean_sample$TARGET_ABANDONED)
+```
+
+## Train and test sets
+
+```{r train and test}
+# get all unique customer id's for sampling
+all_customer_ids <- master_model_data_clean_sample |>
+  distinct(CUSTOMER_ID) |>
+  pull(CUSTOMER_ID) 
+
+# get sample of customer id's to be used in training fold
+index <- sample(x = all_customer_ids, size = floor(length(all_customer_ids) * 0.70), replace = FALSE)
+
+# Subset train using index to create a 70% train_fold
+train_fold <- master_model_data_clean_sample |> 
+  filter(CUSTOMER_ID %in% index)
+
+# Subset the remaining rows not included in index to create a 30% validation fold
+validation_fold <- master_model_data_clean_sample |> 
+  filter(!(CUSTOMER_ID %in% index))
+
+#large imbalance so going to down sample
+table(train_fold$TARGET_ABANDONED)
+
+#have to make factor 
+train_fold <- train_fold |>
+  mutate(TARGET_ABANDONED = factor(TARGET_ABANDONED))
+validation_fold <- validation_fold |>
+  mutate(TARGET_ABANDONED = factor(TARGET_ABANDONED))
+
+# getting event names so training and validation levels can match
+train_events_char <- as.character(train_fold$event_name)
+validation_events_char <- as.character(validation_fold$event_name)
+
+full_levels_events <- sort(unique(c(train_events_char, validation_events_char)))
+
+# apply all factor leveles to training data
+train_fold$event_name <- factor(train_events_char, 
+                                levels = full_levels_events)
+
+## apply all factor leveles to validation data
+validation_fold$event_name <- factor(validation_events_char, 
+                                     levels = full_levels_events)
+
+# make device category a factor
+train_fold <- train_fold |>
+  mutate(device_category = factor(device_category))
+validation_fold <- validation_fold |>
+  mutate(device_category = factor(device_category))
+
+# downsampling due to highly imbalanced distribution
+train_fold <- downSample(x = train_fold |> select(-TARGET_ABANDONED), y = train_fold$TARGET_ABANDONED)
+
+# rename class to target abandoned
+train_fold <- train_fold |> rename(TARGET_ABANDONED = Class)
+
+# quick check on distribution
+table(train_fold$TARGET_ABANDONED)
+```
+
+# Models
+
+## Performance Benchmark
+
+```{r performance benchmark}
+# probability of abandoned
+p_yes <- mean(train_fold$TARGET_ABANDONED == 1)
+
+# Predict 1 with probability p_yes
+random_pred <- rbinom(nrow(validation_fold), size = 1, prob = p_yes)
+
+# Evaluate accuracy
+mean(random_pred == validation_fold$TARGET_ABANDONED)
+
+# Evaluating AUC
+roc_random <- roc(validation_fold$TARGET_ABANDONED, random_pred)
+auc(roc_random)
+```
+
+This provides a benchmark for our models. A random classifier is around 50% accurate
+with an AUC score of .5. This is just a random guess with no predictive power.
+
+## Decision Tree
+
+```{r decision tree train, eval=FALSE}
+dec_tree <- C5.0(TARGET_ABANDONED ~ event_name + device_category, data = train_fold)
+```
+
+```{r decision tree results}
+tree_preds <- predict(dec_tree, newdata = validation_fold, type = "prob")[,2]
+
+# get AUC score
+auc_dec <- roc(validation_fold$TARGET_ABANDONED, tree_preds)
+auc_dec$auc
+
+# find best threshold
+thr <- as.numeric(coords(auc_dec, "best", ret = "threshold"))
+
+# Convert probabilities to predicted classes
+pred_dec <- ifelse(tree_preds > thr, "1", "0")
+
+# factor with same levels as validation fold
+pred_dec <- factor(pred_dec, levels = levels(validation_fold$TARGET_ABANDONED))
+
+# Confusion matrix
+confusionMatrix(pred_dec, validation_fold$TARGET_ABANDONED)
+```
+
+```{r decision tree trials, eval=FALSE}
+dec_tree_2 <- C5.0(TARGET_ABANDONED ~ event_name + device_category, data = train_fold, trials = 3)
+```
+
+```{r trials results}
+tree_preds_trial <- predict(dec_tree_2, newdata = validation_fold, type = "prob")[,2]
+
+# get AUC score
+auc_trials <- roc(validation_fold$TARGET_ABANDONED, tree_preds_trial)
+auc_trials$auc
+
+# find best threshold
+thr <- as.numeric(coords(auc_trials, "best", ret = "threshold"))
+
+# Convert probabilities to predicted classes
+pred_trial <- ifelse(tree_preds_trial > thr, "1", "0")
+
+# factor with same levels as validation fold
+pred_trial <- factor(pred_trial, levels = levels(validation_fold$TARGET_ABANDONED))
+
+# Confusion matrix
+confusionMatrix(pred_trial, validation_fold$TARGET_ABANDONED)
+```
