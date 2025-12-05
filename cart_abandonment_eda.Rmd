@@ -15,11 +15,13 @@ editor_options:
 # Setup
 
 ```{r package loading, message=FALSE}
+# load packages
 library(tidyverse)
 library(janitor)
 ```
 
 ```{r load data, message=FALSE}
+# load data
 customer <- read_csv("customer.csv")
 cutoff_times <- read_csv("cutoff_times.csv")
 google_analytics <- read_csv("google_analytics.csv")
@@ -135,17 +137,6 @@ ga_copy |>
     x = "Device brand",
     y = "Number of Events"
   )
-
-# average time between events?
-
-# this code is taking too long to run
-event_gaps <- ga_copy |>
-  arrange(customer_id, event_timestamp) %>%
-  group_by(customer_id, event_date) %>%               # group within each day
-  mutate(
-    time_since_last = difftime(event_timestamp, lag(event_timestamp), units = "mins")
-  ) %>%
-  ungroup()
 
 # average time from start to purchase?
 time_to_purchase <- ga_copy %>%
